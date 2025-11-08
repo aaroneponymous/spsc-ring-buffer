@@ -145,29 +145,8 @@ namespace SPSC {
             }
         }
 
-        SpscRing(SpscRing&& rhs) noexcept
-            : cap_(rhs.cap_)
-            , buf_(std::move(rhs.buf_))
-            , head_(rhs.head_.load())
-            , tail_(rhs.tail_.load())
-        {
-            rhs.cap_ = 0;
-            rhs.head_.store(0);
-            rhs.tail_.store(0);
-        }
-
-        SpscRing& operator=(SpscRing&& rhs) noexcept {
-            if (this != &rhs) {
-                cap_ = rhs.cap_;
-                buf_ = std::move(rhs.buf_);
-                head_.store(rhs.head_.load(std::memory_order_relaxed));
-                tail_.store(rhs.tail_.load(std::memory_order_relaxed));
-                rhs.cap_ = 0;
-                rhs.head_.store(0);
-                rhs.tail_.store(0);
-            }
-            return *this;
-        }
+        SpscRing(SpscRing&& rhs) noexcept = delete;
+        SpscRing& operator=(SpscRing&& rhs) noexcept = delete;
 
         SpscRing(const SpscRing&) = delete;
         SpscRing& operator=(const SpscRing&) = delete;
@@ -181,12 +160,18 @@ namespace SPSC {
         bool empty() const noexcept { return size() == 0; }
         bool full()  const noexcept { return size() == cap_; }
 
-        bool try_push(const T& v) noexcept {
-            if (full()) return false;
-            auto t = tail_.load(std::memory_order_relaxed);
-            buf_[t % cap_] = v;
-            tail_.store(t + 1, std::memory_order_relaxed);
-            return true;
+        bool try_push(const T& item) noexcept 
+        {
+            std::size_t tail = tail_.load(std::memory_order_relaxed);
+            std::size_t next_tail = (tail + 1) & (cap_ - 1);
+
+            if (next_tail != head_.load(std::memory_order_acquire))
+            {
+                
+                
+            }
+
+
         }
 
         bool try_push(T&& v) noexcept {
@@ -225,7 +210,7 @@ namespace SPSC {
         {
             const uint64_t cap_uint64 = BitOps::ceilPow2(static_cast<uint64_t>(capacity));
             const auto cap = static_cast<std::size_t>(cap_uint64);
-            buffer = new std::byte[size_NodeT * cap];
+            buffer = new Node_t[size_NodeT * cap];
             cap_ = cap;
         }
 
@@ -237,20 +222,28 @@ namespace SPSC {
         // private so user can't erroneously access places other than the head_ & tail_ (don't really need it though)
         // if only access and modification by head_ and tail_
 
-        std::size_t getPos(std::size_t index)
+        // Assertions (Check Validity of Behavior UB etc.)
+        T & operator[](int index)
         {
-            // 
+            const std::size_t norm_pos = ring_buffer_ + (static_cast<std::size_t>(index) * NodeT);
+            NodeT * node = ring_buffer_[norm_pos];
+            return *node.get();
         }
 
 
+        T & operator[](int index) const
+        {
+            const std::size_t norm_pos = ring_buffer_ + (static_cast<std::size_t>(index) * NodeT);
+            NodeT * node = ring_buffer_[norm_pos];
+            return *node.get();
+        }
 
-    
     private:
-        std::size_t                cap_;
-        std::byte                 *buffer_;
-        std::vector<T>             buf_;
-        std::atomic<std::size_t>   head_;
-        std::atomic<std::size_t>   tail_;
+        std::size_t cap_;
+        NodeT * ring_buffer_;
+        std::vector<T> buf_;
+        std::atomic<std::size_t> head_;
+        std::atomic<std::size_t> tail_;
     };
 
 } // namespace SPSC
