@@ -230,10 +230,22 @@ namespace SPSC {
         }
 
         // implement pointer arithmetic to access objects from buffer with support of operator[]
+        // just operator[] for now
+        // reference operator[](size_type pos); (constexpr since C++20)
+        // const_reference operator[](size_tupe pos) const; (constexpr since C++20)
+        // both accessor & mutator
+        // private so user can't erroneously access places other than the head_ & tail_ (don't really need it though)
+        // if only access and modification by head_ and tail_
+
+        std::size_t getPos(std::size_t index)
+        {
+            // 
+        }
+
+
+
     
     private:
-
-
         std::size_t                cap_;
         std::byte                 *buffer_;
         std::vector<T>             buf_;
