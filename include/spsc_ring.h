@@ -116,28 +116,23 @@ namespace SPSC {
     template <class T>
     class SpscRing final
     {
-        struct NodeT
+        struct Slot 
         {
-            alignas(T) std::byte raw_bytes[sizeof(T)];
+            alignas(T) std::byte storage[sizeof(T)];
             
             const T* get() const noexcept {
-                return std::launder(reinterpret_cast<const T*>(raw_bytes));
+                return std::launder(reinterpret_cast<const T*>(storage));
             }
 
             T* get() noexcept {
-                return std::launder(reinterpret_cast<T*>(raw_bytes));
+                return std::launder(reinterpret_cast<T*>(storage));
             }
         };
 
 
     public:
         
-        explicit SpscRing() noexcept : SpscRing(0) {}
-        explicit SpscRing(std::size_t capacity) noexcept
-            : cap_(0), buf_(nullptr), head_(0), tail_(0)
-        { 
-            init(capacity);
-        }
+        explicit SpscRing(std::size_t requested = 1) noexcept { init(requested); }
 
         ~SpscRing() noexcept {
             for (auto& x : buf_) {
@@ -151,99 +146,79 @@ namespace SPSC {
         SpscRing(const SpscRing&) = delete;
         SpscRing& operator=(const SpscRing&) = delete;
 
-        std::size_t capacity() const noexcept { return cap_; }
+        std::size_t capacity() const noexcept { return cap_ - 1; } // to account for 1 empty slot (full/empty)
 
         std::size_t size() const noexcept {
             return tail_.load() - head_.load();
         }
 
-        bool empty() const noexcept { return size() == 0; }
-        bool full()  const noexcept { return size() == cap_; }
+        bool empty() const noexcept
+        {
+            return head_.load(std::memory_order_relaxed) == tail_.load(std::memory_order_relaxed); // why both relaxed?
+        }
+
+        bool full()  const noexcept 
+        { 
+            return next(tail_.load(std::memory_order_relaxed)) == head_.load(std::memory_order_relaxed); // why both relaxed?
+        }
 
         bool try_push(const T& item) noexcept 
         {
-            std::size_t tail = tail_.load(std::memory_order_relaxed);
-            std::size_t next_tail = (tail + 1) & (cap_ - 1);
-
-            if (next_tail != head_.load(std::memory_order_acquire))
-            {
-                
-                
-            }
-
-
+            return emplaceImpl([&](void* p){ ::new (p) T(item); });
         }
 
-        bool try_push(T&& v) noexcept {
-            if (full()) return false;
-            auto t = tail_.load();
-            buf_[t % cap_] = std::move(v);
-            tail_.store(t + 1);
+        bool try_push(T&& v) noexcept 
+        {
             return true;
         }
 
         template <class... Args>
-        bool try_emplace(Args&&... args) noexcept {
-            if (full()) return false;
-            auto t = tail_.load();
-            new (&buf_[t % cap_]) T(std::forward<Args>(args)...);
-            tail_.store(t + 1, std::memory_order_relaxed);
+        bool try_emplace(Args&&... args) noexcept
+        {
             return true;
         }
 
-        bool try_pop(T& out) noexcept {
-            if (empty()) return false;
-            auto h = head_.load(std::memory_order_relaxed);
-            out = std::move(buf_[h % cap_]);
-            head_.store(h + 1, std::memory_order_relaxed);
+        bool try_pop(T& out) noexcept 
+        {
             return true;
         }
 
     private:
         
-        static constexpr std::size_t alignment_T = alignof(T);
-        static constexpr std::size_t size_T = sizeof(T);
-        static constexpr std::size_t size_NodeT = sizeof(NodeT);
+        std::size_t cap_{0};
+        std::size_t mask_{0};
+        Slot * ring_{nullptr};
+        std::atomic_size_t head_{0};
+        std::atomic_size_t tail_{0};
+        
+        static constexpr std::size_t ALIGNMENT_T = alignof(T);
+        static constexpr std::size_t SIZE_T = sizeof(T);
+        static constexpr std::size_t SIZE_SLOT = sizeof(Slot);
 
         // @init: Ensure only one thread inits and no other thread initializes again 
-        void init(std::size_t capacity) noexcept
+        void init(std::size_t requested) noexcept
         {
-            const uint64_t cap_uint64 = BitOps::ceilPow2(static_cast<uint64_t>(capacity));
+            const uint64_t cap_uint64 = BitOps::ceilPow2(static_cast<uint64_t>(requested + 1));
             const auto cap = static_cast<std::size_t>(cap_uint64);
-            buffer = new Node_t[size_NodeT * cap];
+            // Array of over-aligned slots; alignment is correct for T
+            ring_ = static_cast<Slot*>(::operator new[](cap_ * SIZE_SLOT, std::align_val_t{ALIGNMENT_T}));
             cap_ = cap;
+            mask_ = cap_ - 1;
         }
 
-        // implement pointer arithmetic to access objects from buffer with support of operator[]
-        // just operator[] for now
-        // reference operator[](size_type pos); (constexpr since C++20)
-        // const_reference operator[](size_tupe pos) const; (constexpr since C++20)
-        // both accessor & mutator
-        // private so user can't erroneously access places other than the head_ & tail_ (don't really need it though)
-        // if only access and modification by head_ and tail_
+        std::size_t next(std::size_t i) const noexcept { return (i + 1) & mask_; }
 
-        // Assertions (Check Validity of Behavior UB etc.)
-        T & operator[](int index)
+        template<class Fn>
+        bool emplaceImpl(Fn&& construct)
         {
-            const std::size_t norm_pos = ring_buffer_ + (static_cast<std::size_t>(index) * NodeT);
-            NodeT * node = ring_buffer_[norm_pos];
-            return *node.get();
+            auto t = tail_.load(std::memory_order_relaxed);
+            auto n = next(t);
+            if (n == head_.load(std::memory_order_acquire)) return false;
+            void* p = static_cast<void*>(ring_[t].get());
+            construct(p);
+            tail_.store(n, std::memory_order_relase);
+            return true;
         }
-
-
-        T & operator[](int index) const
-        {
-            const std::size_t norm_pos = ring_buffer_ + (static_cast<std::size_t>(index) * NodeT);
-            NodeT * node = ring_buffer_[norm_pos];
-            return *node.get();
-        }
-
-    private:
-        std::size_t cap_;
-        NodeT * ring_buffer_;
-        std::vector<T> buf_;
-        std::atomic<std::size_t> head_;
-        std::atomic<std::size_t> tail_;
     };
 
 } // namespace SPSC
