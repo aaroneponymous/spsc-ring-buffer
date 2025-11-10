@@ -2,12 +2,11 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
-#include <new>
+#include <new>   // std::hardware_destructive_interfence_size
 #include <concepts>
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <mutex>
 
 // -- For Log Table --
 #include <array>
@@ -114,29 +113,48 @@ namespace SPSC {
      *
     */
 
-    template <typename T>
+    template <class T>
     class SpscRing final
     {
-        struct Slot 
+        struct Slot final
         {
-            alignas(T) std::byte storage[sizeof(T)];
+            alignas(T) std::byte obj_buf[sizeof(T)];
 
-            // no launder pre-construction
-            T* getRaw() noexcept { return reinterpret_cast<T*>(storage); }
+            // tail_ writes (pre-condition: no object exists/has been destroyed) - no launder
+            T* raw() noexcept {
+                return reinterpret_cast<T*>(obj_buf);
+            }
 
-            // launder post-cosntruction
-            const T* get() const noexcept { return std::launder(reinterpret_cast<const T*>(storage)); }
-            T* get() noexcept { return std::launder(reinterpret_cast<T*>(storage)); }
+            const T* obj() noexcept const {
+                return std::launder(reinterpret_cast<const T*>(obj_buf));
+            }
+
+            // head_ reads (pre-condition: object exists/prevent a stale version) - launder
+            T* obj() noexcept {
+                return std::launder(reinterpret_cast<T*>(obj_buf));
+            }
+
         };
 
     public:
-        explicit SpscRing(std::size_t requested = 1) noexcept { init(requested); }
+        explicit SpscRing() noexcept : SpscRing(1) {}
+        explicit SpscRing(std::size_t cap) noexcept
+        {
+            std::size_t cap_checked = (BitOps::isPow2(static_cast<uint64_t>(cap)) ? cap : 
+                static_cast<std::size_t>(BitOps::ceilPow2(static_cast<uint64_t>(cap))));
+            buffer_ = new Slot[cap_checked];
+            cap_ = cap_checked;
+
+        } 
 
         ~SpscRing() noexcept {
-            for (auto& x : buf_) {
-                x.~T();
-            }
+            if (!buffer_) return;
+            auto h = head_.load(std::memory_order_relaxed);
+            auto t = tail_.load(std::memory_order_relaxed);
+            while (h != t) { std::destroy_at(buffer_[h].obj()); h = (h + 1) & (cap_ - 1); }
+            delete[] buffer_;
         }
+
 
         SpscRing(SpscRing&& rhs) noexcept = delete;
         SpscRing& operator=(SpscRing&& rhs) noexcept = delete;
@@ -144,90 +162,88 @@ namespace SPSC {
         SpscRing(const SpscRing&) = delete;
         SpscRing& operator=(const SpscRing&) = delete;
 
-        std::size_t capacity() const noexcept { return cap_ - 1; } // to account for 1 empty slot (full/empty)
+        std::size_t capacity() const noexcept { return cap_; }
 
-        std::size_t size() const noexcept {
-            return tail_.load() - head_.load();
-        }
-
-        bool empty() const noexcept
+        std::size_t size() const noexcept
         {
-            return head_.load(std::memory_order_relaxed) == tail_.load(std::memory_order_relaxed); // why both relaxed?
+            std::size_t head = head_.load(std::memory_order_acquire);
+            std::size_t tail = tail_.load(std::memory_order_acquire);
+            return (tail - head) & (cap_ - 1);
         }
 
-        bool full()  const noexcept 
-        { 
-            return next(tail_.load(std::memory_order_relaxed)) == head_.load(std::memory_order_relaxed); // why both relaxed?
-        }
-
-        bool try_push(const T& item) noexcept 
-        {
-            return true;
-
-        }
-
-        bool try_push(T&& v) noexcept 
-        {
-            return true;
-        }
-
-        template <typename... ArgsT>
-        bool try_emplace(ArgsT&&... args) noexcept
+        bool empty() const noexcept { return size() == 0; }
+        bool full() const noexcept 
         {
             auto t = tail_.load(std::memory_order_relaxed);
-            auto n = next(t);
-            if (n == head_.load(std::memory_order_acquire)) return false;
+            auto n = (t + 1) & (cap_ - 1);
+            return n == head_.load(std::memory_order_acquire);
+        }
 
-            // std::construct_at [no placement new | no launder]
-            T* t_slot = ring_[t].getRaw();
+        // Producer Thread: tail_ (can see previous writes to tail)
+        // std::memory_order_relaxed
+        bool try_push(const T& v) noexcept(noexcept(T(v)))
+        {
+            std::size_t tail = tail_.load(std::memory_order_relaxed);
+            std::size_t tail_next = (tail + 1) & (cap_ - 1);
 
+            if (tail_next == head_.load(std::memory_order_acquire))  return false;
+            std::construct_at(buffer_[tail].raw(), v);
+            tail_.store(tail_next, std::memory_order_release);
+            return true;
+        }
+
+        bool try_push(T&& v) noexcept(noexcept(T(std::move(v)))) 
+        {
+            std::size_t tail = tail_.load(std::memory_order_relaxed);
+            std::size_t tail_next = (tail + 1) & (cap_ - 1);
+
+            if (tail_next == head_.load(std::memory_order_acquire))  return false;
+            std::construct_at(buffer_[tail].raw(), std::move(v));
+            tail_.store(tail_next, std::memory_order_release);
+            return true;
+        }
+
+        template <class... Args>
+            requires std::constructible_from<T, Args...>
+        bool try_emplace(Args&&... args) noexcept
+        {
+            std::size_t tail = tail_.load(std::memory_order_relaxed);
+            std::size_t tail_next = (tail + 1) & (cap_ - 1);
+            if (tail_next == head_.load(std::memory_order_acquire)) return false;
+
+            std::construct_at(buffer_[tail].raw(), std::forward<Args>(args)...);
+            tail_.store(tail_next, std::memory_order_release);
             return true;
         }
 
         bool try_pop(T& out) noexcept 
         {
+            const std::size_t head = head_.load(std::memory_order_relaxed);
+            if (head == tail_.load(std::memory_order_acquire)) return false;
+
+            T* object = buffer_[head].obj();
+            out = std::move(*object);
+            std::destroy_at(object);
+
+            head_.store((head + 1) & (cap_ - 1), std::memory_order_release);
             return true;
         }
 
     private:
-        
-        std::size_t cap_{0};
-        std::size_t mask_{0};
-        Slot * ring_{nullptr};
-        std::atomic_size_t head_{0};
-        std::atomic_size_t tail_{0};
-        
-        static constexpr std::size_t ALIGNMENT_T = alignof(T);
-        static constexpr std::size_t SIZE_T = sizeof(T);
-        static constexpr std::size_t SIZE_SLOT = sizeof(Slot);
 
-        // @init: Ensure only one thread inits and no other thread initializes again 
-        void init(std::size_t requested) noexcept
-        {
-            const uint64_t cap_uint64 = BitOps::ceilPow2(static_cast<uint64_t>(requested + 1));
-            const auto cap = static_cast<std::size_t>(cap_uint64);
-            ring_ = new Slot[cap * SIZE_SLOT];
-            cap_ = cap;
-            mask_ = cap_ - 1;
-        }
+        #ifdef __cpp_lib_hardware_interference_size
+            inline static constexpr std::size_t cache_align = std::hardware_destructive_interference_size;
+        #else
+            // 64 bytes on x86-64 │ L1_CACHE_BYTES │ L1_CACHE_SHIFT │ __cacheline_aligned │ ...
+            inline static constexpr std::size_t cache_align = 64;
+        #endif
 
-        std::size_t next(std::size_t i) const noexcept { return (i + 1) & mask_; }
 
-        namespace Compatible17 {
-            
-            template<class Fn>
-            bool emplaceImpl(Fn&& construct)
-            {
-                auto t = tail_.load(std::memory_order_relaxed);
-                auto n = next(t);
-                if (n == head_.load(std::memory_order_acquire)) return false;
-                void* p = static_cast<void*>(ring_[t].get());
-                construct(p);
-                tail_.store(n, std::memory_order_relase);
-                return true;
-            }
-        };
+        std::size_t cap_;
+        alignas(cache_align) std::atomic<std::size_t> head_{ 0 };
+        alignas(cache_align) std::atomic<std::size_t> tail_{ 0 };
+        Slot *buffer_{ nullptr };
 
     };
 
-} // namespace SPSC
+} // namespace SpscRing
