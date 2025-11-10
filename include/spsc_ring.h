@@ -137,8 +137,8 @@ namespace SPSC {
         };
 
     public:
-        explicit SpscRing() noexcept : SpscRing(1) {}
-        explicit SpscRing(std::size_t cap) noexcept
+        explicit SpscRing() : SpscRing(1) {}
+        explicit SpscRing(std::size_t cap)
         {
             std::size_t cap_checked = (BitOps::isPow2(static_cast<uint64_t>(cap)) ? cap : 
                 static_cast<std::size_t>(BitOps::ceilPow2(static_cast<uint64_t>(cap))));

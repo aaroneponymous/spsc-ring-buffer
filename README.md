@@ -21,10 +21,10 @@ Elements are **constructed in-place** on push and **destroyed** on pop; storage 
 ## Public API
 
 ```cpp
-explicit SpscRing() noexcept;
-explicit SpscRing(std::size_t cap) noexcept;
+explicit SpscRing();
+explicit SpscRing(std::size_t cap);
 
-~SpscRing() noexcept;
+~SpscRing();
 
 SpscRing(const SpscRing&)            = delete;
 SpscRing& operator=(const SpscRing&) = delete;
