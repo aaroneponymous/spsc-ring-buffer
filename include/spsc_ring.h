@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <new>
+#include <concepts>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -113,25 +114,22 @@ namespace SPSC {
      *
     */
 
-    template <class T>
+    template <typename T>
     class SpscRing final
     {
         struct Slot 
         {
             alignas(T) std::byte storage[sizeof(T)];
-            
-            const T* get() const noexcept {
-                return std::launder(reinterpret_cast<const T*>(storage));
-            }
 
-            T* get() noexcept {
-                return std::launder(reinterpret_cast<T*>(storage));
-            }
+            // no launder pre-construction
+            T* getRaw() noexcept { return reinterpret_cast<T*>(storage); }
+
+            // launder post-cosntruction
+            const T* get() const noexcept { return std::launder(reinterpret_cast<const T*>(storage)); }
+            T* get() noexcept { return std::launder(reinterpret_cast<T*>(storage)); }
         };
 
-
     public:
-        
         explicit SpscRing(std::size_t requested = 1) noexcept { init(requested); }
 
         ~SpscRing() noexcept {
@@ -164,7 +162,8 @@ namespace SPSC {
 
         bool try_push(const T& item) noexcept 
         {
-            return emplaceImpl([&](void* p){ ::new (p) T(item); });
+            return true;
+
         }
 
         bool try_push(T&& v) noexcept 
@@ -172,9 +171,16 @@ namespace SPSC {
             return true;
         }
 
-        template <class... Args>
-        bool try_emplace(Args&&... args) noexcept
+        template <typename... ArgsT>
+        bool try_emplace(ArgsT&&... args) noexcept
         {
+            auto t = tail_.load(std::memory_order_relaxed);
+            auto n = next(t);
+            if (n == head_.load(std::memory_order_acquire)) return false;
+
+            // std::construct_at [no placement new | no launder]
+            T* t_slot = ring_[t].getRaw();
+
             return true;
         }
 
@@ -200,25 +206,28 @@ namespace SPSC {
         {
             const uint64_t cap_uint64 = BitOps::ceilPow2(static_cast<uint64_t>(requested + 1));
             const auto cap = static_cast<std::size_t>(cap_uint64);
-            // Array of over-aligned slots; alignment is correct for T
-            ring_ = static_cast<Slot*>(::operator new[](cap_ * SIZE_SLOT, std::align_val_t{ALIGNMENT_T}));
+            ring_ = new Slot[cap * SIZE_SLOT];
             cap_ = cap;
             mask_ = cap_ - 1;
         }
 
         std::size_t next(std::size_t i) const noexcept { return (i + 1) & mask_; }
 
-        template<class Fn>
-        bool emplaceImpl(Fn&& construct)
-        {
-            auto t = tail_.load(std::memory_order_relaxed);
-            auto n = next(t);
-            if (n == head_.load(std::memory_order_acquire)) return false;
-            void* p = static_cast<void*>(ring_[t].get());
-            construct(p);
-            tail_.store(n, std::memory_order_relase);
-            return true;
-        }
+        namespace Compatible17 {
+            
+            template<class Fn>
+            bool emplaceImpl(Fn&& construct)
+            {
+                auto t = tail_.load(std::memory_order_relaxed);
+                auto n = next(t);
+                if (n == head_.load(std::memory_order_acquire)) return false;
+                void* p = static_cast<void*>(ring_[t].get());
+                construct(p);
+                tail_.store(n, std::memory_order_relase);
+                return true;
+            }
+        };
+
     };
 
 } // namespace SPSC
