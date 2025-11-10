@@ -1,4 +1,4 @@
-# `SPSC::SpscRing<T>` — Lock-Free Single-Producer/Single-Consumer Ring
+# `SPSC::SpscRing<T>` : Lock-Free Single-Producer/Single-Consumer Ring
 
 A bounded, lock-free queue specialized for **exactly one producer thread** and **exactly one consumer thread**.
 Elements are **constructed in-place** on push and **destroyed** on pop; storage is a ring of raw, `alignas(T)` bytes.
